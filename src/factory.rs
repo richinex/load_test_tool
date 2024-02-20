@@ -1,11 +1,11 @@
 use log::info;
 
 use futures::future::join_all;
-
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::config::Settings;
+use crate::config::{Settings, Workflow};
 use crate::appstate::AppState;
 use crate::loadtest::LoadTest;
 use crate::tasks::Task;
@@ -14,13 +14,13 @@ use std::{fs, str::FromStr};
 use reqwest::{Client, RequestBuilder};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use crate::config::{ApiConfig, HttpMethod};
-
+use reqwest::Client as HttpClient;
 
 
 
 #[async_trait::async_trait]
 pub trait ApiMonitor {
-    async fn execute(&self, client: &reqwest::Client) -> Result<(), String>;
+    async fn execute(&self, client: &reqwest::Client, workflow_name: &str) -> Result<(), String>;
     fn describe(&self) -> String;
     fn response_time_threshold(&self) -> Option<u64>; // Threshold in seconds
     fn get_task_order(&self) -> usize;
@@ -56,7 +56,7 @@ pub fn create_request_builder(client: &Client, api_config: &ApiConfig) -> Result
     request_builder
 }
 
-pub fn create_monitor_tasks(cfg: &Settings, app_state: Arc<Mutex<AppState>>) -> VecDeque<Box<dyn ApiMonitor + Send + Sync>> {
+pub fn create_monitor_tasks(cfg: &Workflow, app_state: Arc<Mutex<AppState>>) -> VecDeque<Box<dyn ApiMonitor + Send + Sync>> {
     let mut tasks: VecDeque<Box<dyn ApiMonitor + Send + Sync>> = VecDeque::new();
 
     for api_config in cfg.apis.iter() {
@@ -83,46 +83,28 @@ pub fn create_monitor_tasks(cfg: &Settings, app_state: Arc<Mutex<AppState>>) -> 
 }
 
 
+async fn monitor_single_workflow(workflow: Arc<Workflow>, app_state: Arc<Mutex<AppState>>, client: HttpClient) {
+    let workflow_name = &workflow.name;
+    let tasks = create_monitor_tasks(&workflow, app_state);
 
-pub async fn start_monitoring(cfg: Arc<Settings>, app_state: Arc<Mutex<AppState>>) {
-    let http_config = HttpClientConfig {
-        timeout_seconds: cfg.http_timeout_seconds,
-        proxy_url: cfg.http_proxy_url.clone(),
-        default_headers: cfg.http_default_headers.clone(),
-    };
-
-    let client = http_client::get_client(Some(http_config)).expect("Failed to create HTTP client");
-
-    // Create tasks based on the configuration
-    let tasks = create_monitor_tasks(&cfg, app_state);
-
-    // Instead of trying to access `task_order` directly from `cfg.apis`, which is incorrect,
-    // you should leverage the tasks created by `create_monitor_tasks` function.
-    // This assumes that each task holds a reference to its configuration, including `task_order`.
-
-    // Group tasks by `task_order`. This requires that your task implementations
-    // provide access to their respective `ApiConfig` (or at least the `task_order`).
-    let mut grouped_tasks: std::collections::HashMap<usize, Vec<Box<dyn ApiMonitor + Send + Sync>>> = std::collections::HashMap::new();
+    let mut grouped_tasks: HashMap<usize, Vec<Box<dyn ApiMonitor + Send + Sync>>> = HashMap::new();
     for task in tasks {
-        // Assuming each task type has a method to access its `task_order`
-        let order = task.get_task_order(); // Corrected line
+        let order = task.get_task_order(); // Assume this exists and is correct
         grouped_tasks.entry(order).or_insert_with(Vec::new).push(task);
     }
 
-    // Sort group keys to ensure tasks are executed in the correct order
     let mut order_keys: Vec<&usize> = grouped_tasks.keys().collect();
     order_keys.sort();
 
-    // Execute task groups in sorted order
     for order_key in order_keys {
         if let Some(task_group) = grouped_tasks.get(order_key) {
             let futures: Vec<_> = task_group.iter().map(|task| {
                 let client_clone = client.clone();
                 async move {
-                    info!("Starting '{}'", task.describe()); // Log the start of a task using its name
-                    match task.execute(&client_clone).await {
-                        Ok(_) => info!("Successfully completed '{}'", task.describe()), // Log successful completion
-                        Err(e) => log::error!("Task '{}' failed: {}", task.describe(), e), // Log failure with task name
+                    info!("Starting '{}'", task.describe());
+                    match task.execute(&client_clone, workflow_name).await {
+                        Ok(_) => info!("Successfully completed '{}'", task.describe()),
+                        Err(e) => log::error!("Task '{}' failed: {}", task.describe(), e),
                     }
                 }
             }).collect();
@@ -132,3 +114,25 @@ pub async fn start_monitoring(cfg: Arc<Settings>, app_state: Arc<Mutex<AppState>
     }
 }
 
+
+
+// Updated function signature to accept a vector of workflows
+pub async fn start_monitoring(settings: Arc<Settings>, workflows: Vec<Arc<Workflow>>, app_state: Arc<Mutex<AppState>>) {
+    let http_config = HttpClientConfig {
+        timeout_seconds: settings.http_timeout_seconds,
+        proxy_url: settings.http_proxy_url.clone(),
+        default_headers: settings.http_default_headers.clone(),
+    };
+
+    let client = http_client::get_client(Some(http_config)).expect("Failed to create HTTP client");
+
+    // Iterate over workflows and spawn a new async task for each
+    let futures: Vec<_> = workflows.into_iter().map(|workflow| {
+        let app_state_clone = app_state.clone();
+        let client_clone = client.clone();
+        monitor_single_workflow(workflow, app_state_clone, client_clone)
+    }).collect();
+
+    // Wait for all spawned tasks to complete
+    join_all(futures).await;
+}

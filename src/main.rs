@@ -4,132 +4,139 @@ pub mod utils;
 pub mod factory;
 pub mod loadtest;
 pub mod tasks;
+pub mod cli;
 
-use actix_web::{web, App, HttpResponse, HttpServer};
-use config::{load_config, Settings};
+use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use cli::process_http_default_headers;
+use config::{load_workflow, Settings, Workflow};
 use factory::start_monitoring;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 use crate::appstate::AppState;
+use crate::cli::build_cli;
 
 
 
-// The entry point of the Actix web server.
+// Entry point for the Actix web server.
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // Load the application configuration asynchronously and initialize logging.
-    // `load_config` is an async function that loads settings from a configuration source (e.g., a file or environment variables).
-    let settings = load_config().await.expect("Failed to load configuration");
-    settings.init_logging(); // Initialize logging as configured in `settings`.
+    // Parse command line arguments using clap.
+    let matches = build_cli().get_matches();
 
-    // Wrap the loaded settings in an `Arc` for thread-safe reference counting.
-    // This allows the settings to be shared across multiple parts of the application without copying them.
-    let settings_arc = Arc::new(settings);
+    // Extract configuration file or directory from CLI arguments.
+    let config_file = matches.get_one::<String>("config").map(|s| s.to_string());
+    let config_dir = matches.get_one::<String>("config-dir").map(|s| s.to_string());
 
-    // Create the shared application state, including a mutex-protected hash map for load test monitoring data.
-    // Wrapping this state in an `Arc` and `Mutex` ensures thread-safe mutable access across async tasks.
+    // Load workflows based on provided configuration.
+    let workflows = load_workflow(config_file, config_dir).await.expect("Failed to load workflows");
+
+    // Extract optional HTTP proxy URL from CLI arguments.
+    let http_proxy_url = matches.get_one::<String>("http_proxy_url").map(|s| s.to_string());
+
+    // Process and validate HTTP default headers specified in CLI arguments.
+    let http_default_headers = process_http_default_headers(&matches)
+        .unwrap_or_else(|err| {
+            eprintln!("Error processing HTTP default headers: {}", err);
+            std::process::exit(1);
+        });
+
+    // Initialize application settings based on CLI arguments.
+    let global_settings = Settings {
+        monitoring_interval_seconds: matches.get_one::<String>("monitoring_interval_seconds")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60), // Default to 60 seconds if not specified
+        log_level: matches.get_one::<String>("log_level")
+            .unwrap_or(&"info".to_string()).clone(), // Default to "info" if not specified
+        http_timeout_seconds: matches.get_one::<String>("http_timeout_seconds")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20), // Default to 20 seconds if not specified
+        http_proxy_url,
+        http_default_headers,
+    };
+
+    // Initialize logging based on the specified log level.
+    global_settings.init_logging();
+
+    // Wrap workflows and settings in Arcs for thread-safe shared access across async tasks.
+    let workflows_arc = Arc::new(workflows.into_iter().map(Arc::new).collect::<Vec<_>>());
+    let settings_arc = Arc::new(global_settings);
+
+    // Prepare the shared application state for concurrent access.
     let app_state_arc = Arc::new(Mutex::new(AppState {
         load_test_monitoring_data: Arc::new(Mutex::new(HashMap::new())),
         task_monitoring_data: Arc::new(Mutex::new(HashMap::new())),
     }));
 
-    // Wrap the shared application state (`app_state_arc`) and settings (`settings_arc`) in `web::Data` for Actix.
-    // `web::Data` provides an efficient way to access shared data within request handlers.
+    // Make shared state accessible in Actix web handlers through web::Data.
     let app_state_for_actix = web::Data::new(app_state_arc.clone());
+    let workflows_for_actix = web::Data::new(workflows_arc.clone());
     let settings_for_actix = web::Data::new(settings_arc.clone());
 
-    // Spawn a background task to start monitoring.
-    // This task uses cloned references to the settings and application state to avoid ownership issues.
-    let settings_clone = settings_arc.clone();
+    // Launch a background task for monitoring based on the current configuration.
+    let workflows_vec = Arc::clone(&workflows_arc);
     let app_state_clone = app_state_arc.clone();
+    let settings_clone = settings_arc.clone();
+
     tokio::spawn(async move {
-        start_monitoring(settings_clone, app_state_clone).await;
+        start_monitoring(settings_clone, (*workflows_vec).clone(), app_state_clone).await;
     });
 
-    // Configure and run the Actix web server.
-    // This includes setting up shared application data and defining route handlers.
+    // Set up and run the Actix web server with configured routes and handlers.
     HttpServer::new(move || {
         App::new()
-            // Add the shared application state and settings to the app's data.
-            // This makes them accessible in route handlers.
-            .app_data(app_state_for_actix.clone()) // Shared state accessible in handlers.
-            .app_data(settings_for_actix.clone()) // Shared settings accessible in handlers.
-
-            // Define routes and their handlers.
-            // `/load_test_data` returns serialized load test monitoring data.
-            // `/trigger_load_tests` triggers the load testing process.
-            .route("/load_test_data", web::get().to(get_load_test_data))
+            .app_data(app_state_for_actix.clone())
+            .app_data(settings_for_actix.clone())
+            .app_data(workflows_for_actix.clone())
+            .route("/load_test_results", web::get().to(get_load_test_data))
             .route("/trigger_load_tests", web::get().to(trigger_monitoring))
-            .route("/http_status_data", web::get().to(get_task_data))
+            .route("/task_results", web::get().to(get_task_data))
     })
-    // Bind the server to an IP address and port.
     .bind("127.0.0.1:8080")?
-    // Start the server asynchronously.
     .run()
     .await
 }
 
 
-
-// An asynchronous function designed to handle web requests to retrieve load test data.
-// It takes the shared application state as a parameter.
+// Handles web requests to retrieve load test data, utilizing shared application state.
 async fn get_load_test_data(
-    // `data`: The shared application state necessary for accessing load test data,
-    // wrapped in `web::Data` for Actix integration and `Arc<Mutex<AppState>>` for thread-safe access.
-    data: web::Data<Arc<Mutex<AppState>>>
-) -> impl actix_web::Responder {
-
-    // Lock the `app_state` asynchronously to safely access its contents. This prevents data races
-    // when multiple threads attempt to access `app_state` concurrently.
+    data: web::Data<Arc<Mutex<AppState>>> // Provides thread-safe access to the AppState.
+) -> impl Responder {
+    // Asynchronously acquires a lock on AppState to access its contents safely.
     let app_state = data.lock().await;
 
-    // Once the lock is acquired, access the `load_test_monitoring_data` within `app_state`.
-    // This also requires a lock because it's wrapped in a `Mutex`, ensuring safe access to the
-    // mutable load test data.
+    // Locks the load test monitoring data for safe access.
     let load_test_data = app_state.load_test_monitoring_data.lock().await;
 
-    // Serialize the load test data to JSON and send it as the response.
-    // The `&*` operator is used to dereference the smart pointer (`MutexGuard`) to access
-    // the underlying data directly for serialization.
+    // Serializes and responds with the load test data in JSON format.
     HttpResponse::Ok().json(&*load_test_data)
 }
 
-// Define an asynchronous function named `trigger_monitoring` that will be used as a route handler.
-// This function is designed to be called from an HTTP route in an Actix Web server.
+// Asynchronously triggers monitoring based on the provided settings, app state, and workflows.
 async fn trigger_monitoring(
-    // The first parameter, `settings`, is of type `web::Data<Arc<Settings>>`.
-    // `web::Data` is a wrapper used by Actix Web to safely share data between handlers.
-    // `Arc<Settings>` is an atomic reference-counted pointer to `Settings`, allowing for thread-safe,
-    // shared access to the application's configuration settings.
-    settings: web::Data<Arc<Settings>>, // Use web::Data to pass Arc<Settings>
+    settings: web::Data<Arc<Settings>>,
+    app_state: web::Data<Arc<Mutex<AppState>>>,
+    workflows: web::Data<Arc<Vec<Arc<Workflow>>>>,
+) -> impl actix_web::Responder {
+    // Clones the settings, app state, and workflows to pass to the monitoring task.
+    let settings_clone = Arc::clone(settings.get_ref());
+    let app_state_clone = Arc::clone(app_state.get_ref());
+    let workflows_clone = Arc::clone(workflows.get_ref());
 
-    // The second parameter, `app_state`, is of type `web::Data<Arc<Mutex<AppState>>>`.
-    // Similar to `settings`, `app_state` uses `web::Data` for sharing across handlers.
-    // `Arc<Mutex<AppState>>` provides thread-safe, mutable access to the application state.
-    // `Mutex` ensures that concurrent access to `AppState` is properly synchronized.
-    app_state: web::Data<Arc<Mutex<AppState>>> // Use web::Data to pass Arc<Mutex<AppState>>
-) -> impl actix_web::Responder { // The function returns a type that implements the `Responder` trait, allowing it to respond to HTTP requests.
-
-    // Inside the function body, `tokio::spawn` is used to execute `start_monitoring` asynchronously.
-    // This allows the load test to run concurrently without blocking the current handler or other parts of the application.
-    tokio::spawn(async move { // `tokio::spawn` takes an async block, moving ownership of captured variables into the block.
-        // `settings.get_ref().clone()` retrieves a reference to the `Arc<Settings>` inside `web::Data` and clones it.
-        // Cloning an `Arc` is cheap and simply increments the reference count.
-        // `app_state.get_ref().clone()` does the same for `Arc<Mutex<AppState>>`, providing a cloned `Arc` to the `start_monitoring` function.
-        // The `start_monitoring` function is then called with these cloned `Arc` references, initiating the load testing process.
-        start_monitoring(settings.get_ref().clone(), app_state.get_ref().clone()).await;
+    // Spawns an asynchronous task to start monitoring with the cloned arguments.
+    tokio::spawn(async move {
+        start_monitoring(settings_clone, (*workflows_clone).clone(), app_state_clone).await;
     });
 
-    // After spawning the load test task, the function immediately responds with an HTTP 200 OK status,
-    // and a body message indicating that the load test has been triggered.
-    // This response is sent back to the client without waiting for the load test to complete,
-    // making the operation effectively non-blocking from the client's perspective.
+    // Responds to indicate that load test monitoring has been triggered.
     HttpResponse::Ok().body("Load test triggered.")
 }
 
+// Retrieves and responds with HTTP status data from the shared application state.
 async fn get_task_data(data: web::Data<Arc<Mutex<AppState>>>) -> impl actix_web::Responder {
+    // Safely accesses the application state and its HTTP status data.
     let app_state = data.lock().await;
     let http_status_data = app_state.task_monitoring_data.lock().await;
 
-    HttpResponse::Ok().json(&*http_status_data) // Serialize the HTTP status monitoring data
+    // Serializes and responds with the HTTP status data in JSON format.
+    HttpResponse::Ok().json(&*http_status_data)
 }

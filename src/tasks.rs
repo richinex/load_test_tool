@@ -1,4 +1,4 @@
-use std::{str::FromStr, sync::Arc};
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 use log::{info,error};
 use tokio::sync::Mutex;
 use reqwest::Client;
@@ -11,6 +11,8 @@ use std::time::Instant;
 /// Represents the data collected during the monitoring of an API call.
 #[derive(Debug, Clone, Serialize)]
 pub struct MonitoringData {
+    /// The name of the workflow this data is associated with.
+    pub api_url: String,
     /// The status of the monitoring operation, e.g., "OK" or "ERROR".
     pub status: String,
     /// The response time measured for the API call, in milliseconds.
@@ -38,14 +40,7 @@ pub struct Task {
 #[async_trait::async_trait]
 impl ApiMonitor for Task {
 
-    /// Executes the task, making the configured API call and monitoring its performance.
-    ///
-    /// # Parameters
-    /// - `client`: The HTTP client used to make the API call.
-    ///
-    /// # Returns
-    /// A result indicating the success or failure of the task execution.
-    async fn execute(&self, client: &Client) -> Result<(), String> {
+    async fn execute(&self, client: &Client, workflow_name: &str) -> Result<(), String> {
         let start = Instant::now();
         let mut headers = HeaderMap::new();
 
@@ -71,12 +66,13 @@ impl ApiMonitor for Task {
                 if resp.status().is_success() {
                     // If the status is within the range of success codes
                     let monitoring_data = MonitoringData {
+                        api_url: self.api_config.url.clone(),
                         status: "OK".to_string(),
                         response_time: duration.as_millis() as u64,
                         status_code: Some(status_code), // Store the successful status code
                         method: self.api_config.method.clone(), // Include the method in the monitoring data
                     };
-                    update_app_state(&self.app_state, &self.api_config.url, MonitoringDataType::Task, monitoring_data).await;
+                    update_app_state(&self.app_state, &workflow_name, &self.api_config.name, MonitoringDataType::Task, monitoring_data).await;
                     info!("'{}' succeeded with status code {} in {:?}", self.api_config.name, status_code, duration);
                     Ok(())
                 } else {
@@ -84,12 +80,13 @@ impl ApiMonitor for Task {
                     let error_message = format!("'{}' responded with HTTP status {}", self.api_config.name, status_code);
                     error!("{}", error_message);
                     let monitoring_data = MonitoringData {
+                        api_url: self.api_config.url.clone(),
                         status: "ERROR".to_string(),
                         response_time: duration.as_millis() as u64,
                         status_code: Some(status_code), // Store the error status code
                         method: self.api_config.method.clone(), // Include the method in the monitoring data
                     };
-                    update_app_state(&self.app_state, &self.api_config.url, MonitoringDataType::Task, monitoring_data).await;
+                    update_app_state(&self.app_state, &workflow_name, &self.api_config.name, MonitoringDataType::Task, monitoring_data).await;
                     Err(error_message)
                 }
             },
@@ -98,58 +95,58 @@ impl ApiMonitor for Task {
                 let error_message = format!("Failed to reach '{}': {}", self.api_config.name, e);
                 error!("{}", &error_message);
                 let monitoring_data = MonitoringData {
+                    api_url: self.api_config.url.clone(),
                     status: "ERROR".to_string(),
                     response_time: duration.as_millis() as u64,
                     status_code: None, // No status code available in case of a connection error
                     method: self.api_config.method.clone(), // Include the method in the monitoring data
                 };
-                update_app_state(&self.app_state, &self.api_config.url, MonitoringDataType::Task, monitoring_data).await;
+                update_app_state(&self.app_state, &workflow_name,  &self.api_config.name, MonitoringDataType::Task, monitoring_data).await;
                 Err(error_message)
             }
         }
     }
 
-    /// Provides a descriptive name for the task, useful for logging and debugging.
-    ///
-    /// # Returns
-    /// A string containing the descriptive name of the task.
     fn describe(&self) -> String {
         format!("Task for {}", self.api_config.name)
     }
 
-    /// Optional: Specifies a response time threshold for the task.
-    ///
-    /// # Returns
-    /// An optional `u64` representing the response time threshold in milliseconds, if applicable.
     fn response_time_threshold(&self) -> Option<u64> {
         None // No specific threshold for HTTP status monitoring
     }
 
-    /// Retrieves the order in which the task should be executed relative to other tasks.
-    ///
-    /// # Returns
-    /// A `usize` representing the task's execution order.
     fn get_task_order(&self) -> usize {
         self.api_config.task_order.unwrap_or(usize::MAX)
     }
 }
 
-/// Updates the shared application state with the results of a monitoring operation.
-///
-/// # Parameters
-/// - `app_state`: A reference to the shared application state.
-/// - `api_url`: The URL of the API call that was monitored.
-/// - `data_type`: The type of monitoring data being recorded.
-/// - `monitoring_data`: The data collected from the monitoring operation.
-async fn update_app_state(app_state: &Arc<Mutex<AppState>>, api_url: &str, data_type: MonitoringDataType, monitoring_data: MonitoringData) {
+
+async fn update_app_state(
+    app_state: &Arc<Mutex<AppState>>,
+    workflow_name: &str,
+    task_name: &str,
+    data_type: MonitoringDataType,
+    monitoring_data: MonitoringData
+) {
+    // Lock the Mutex to access the underlying HashMap
     let state = app_state.lock().await;
 
     // Decide which part of the state to update based on the data type
-    let mut data = match data_type {
-        MonitoringDataType::Task => state.task_monitoring_data.lock().await,
+    match data_type {
+        MonitoringDataType::Task => {
+            // Ensure we have a mutable reference to the HashMap
+            let task_monitoring_data = &mut *state.task_monitoring_data.lock().await;
 
+            // Access or create the nested HashMap for the specified workflow
+            let workflow_data = task_monitoring_data
+                .entry(workflow_name.to_string()) // Now correctly using entry on the HashMap
+                .or_insert_with(HashMap::new);
+
+            // Update the monitoring data for the specific API URL within the workflow
+            workflow_data.insert(task_name.to_string(), monitoring_data);
+
+            log::info!("Updated task data for {} in workflow {}", task_name, workflow_name);
+        },
+        // Handle other data types as needed
     };
-
-    data.insert(api_url.to_string(), monitoring_data);
 }
-

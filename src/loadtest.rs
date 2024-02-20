@@ -33,6 +33,7 @@ pub struct LoadTest {
 /// and distribution of response status codes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadTestMonitoringData {
+    pub api_url: String,
     /// The total number of requests made during the load test.
     pub total_requests: usize,
     /// The number of successful requests.
@@ -71,12 +72,12 @@ impl ApiMonitor for LoadTest {
     ///
     /// # Returns
     /// A `Result` indicating the success or failure of the load test execution.
-    async fn execute(&self, client: &Client) -> Result<(), String> {
+    async fn execute(&self, client: &Client, workflow_name: &str) -> Result<(), String> {
         let mut attempt = 0;
         let max_attempts = self.load_test_config.retry_count.unwrap_or(0) as usize; // Provide a default value if `retry_count` is None and cast to usize for comparison
 
         while attempt <= max_attempts {
-            match self.run_load_test(client).await {
+            match self.run_load_test(client, workflow_name).await {
                 Ok(_) => return Ok(()),
                 Err(e) if attempt < max_attempts => { // Correct comparison with unwrapped and converted retry_count
                     log::warn!("Load test attempt {} failed: {}. Retrying...", attempt + 1, e);
@@ -130,7 +131,7 @@ impl LoadTest {
     /// # Returns
     /// A `Result<(), String>` indicating the success or failure of the load test.
     /// On success, it returns `Ok(())`. On failure, it returns an `Err` with an error message.
-    async fn run_load_test(&self, client: &Client) -> Result<(), String> {
+    async fn run_load_test(&self, client: &Client, workflow_name: &str) -> Result<(), String> {
         // Records the start time of the load test to calculate the total duration later.
         let start_time = Instant::now();
 
@@ -261,6 +262,7 @@ impl LoadTest {
 
         // Construct LoadTestMonitoringData
         let load_test_data = LoadTestMonitoringData {
+            api_url: self.api_config.url.clone(),
             total_requests: filtered_results.len(),
             success_count,
             failure_count,
@@ -276,7 +278,7 @@ impl LoadTest {
         };
 
         // Update application state with load test data
-        update_load_test_app_state(&self.app_state, &self.api_config.url, load_test_data).await;
+        update_load_test_app_state(&self.app_state, &workflow_name, &self.api_config.name, load_test_data).await;
 
         Ok(())
     }
@@ -388,13 +390,29 @@ fn analyze_results(results: &[(StatusCode, Duration, usize)]) -> (usize, usize, 
 ///
 /// # Parameters
 /// - `app_state`: A reference to the shared application state.
-/// - `api_url`: The URL of the API that was load tested.
+/// - `workflow_name`: The name of the workflow associated with the load test.
+/// - `task_name`: The name of the task associated with the load test.
 /// - `load_test_data`: The aggregated data collected from the load test.
-async fn update_load_test_app_state(app_state: &Arc<Mutex<AppState>>, api_url: &str, load_test_data: LoadTestMonitoringData) {
+async fn update_load_test_app_state(
+    app_state: &Arc<Mutex<AppState>>,
+    workflow_name: &str, // Add workflow_name as a parameter
+    task_name: &str,
+    load_test_data: LoadTestMonitoringData
+) {
+    // Lock the Mutex to access the AppState
     let state = app_state.lock().await;
-    let mut data = state.load_test_monitoring_data.lock().await;
-    data.insert(api_url.to_string(), load_test_data);
+
+    // Access the nested HashMap for load test monitoring data, ensuring to lock it for safe access
+    let load_test_monitoring_data = &mut *state.load_test_monitoring_data.lock().await;
+
+    // Access or create the nested HashMap for the specified workflow
+    let workflow_data = load_test_monitoring_data
+        .entry(workflow_name.to_string()) // Use workflow_name to access the correct entry
+        .or_insert_with(HashMap::new);
+
+    // Update the monitoring data for the specific API URL within the workflow
+    workflow_data.insert(task_name.to_string(), load_test_data);
 
     // Log the update for debugging or informational purposes
-    log::info!("Updated load test data for {}", api_url);
+    log::info!("Updated load test data for {} in workflow {}", task_name, workflow_name);
 }

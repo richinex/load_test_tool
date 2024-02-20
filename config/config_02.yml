@@ -1,4 +1,4 @@
-name: "User Onboarding Workflow"
+name: "User Onboarding Workflow 2"
 apis:
   - name: "Setup Organization"
     url: https://jsonplaceholder.typicode.com/todos/1
@@ -8,16 +8,6 @@ apis:
     expected_field: id  # Specify the JSON field you expect to validate
     response_time_threshold: 2000  # Response time threshold in milliseconds
     load_test: false  # Explicitly marked as not a load test
-
-  - name: "Setup Second Organization"
-    url: https://jsonplaceholder.typicode.com/todos/1
-    task_order: 1
-    method: GET
-    headers: {}  # Specific headers for this API request
-    expected_field: id  # Specify the JSON field you expect to validate
-    response_time_threshold: 2000  # Response time threshold in milliseconds
-    load_test: false  # Explicitly marked as not a load test
-
 
   - name: "Setup Space"
     url: https://jsonplaceholder.typicode.com/posts
