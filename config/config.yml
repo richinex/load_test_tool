@@ -1,0 +1,46 @@
+monitoring_interval_seconds: 60
+log_level: info
+http_timeout_seconds: 20
+http_default_headers:
+  User-Agent: "MonitoringTool/1.0"
+  Accept: "application/json"
+
+apis:
+  - name: "Setup Organization"
+    url: ${ORGANIZATION_API_URL}
+    task_order: 1
+    method: GET
+    headers: {}  # Specific headers for this API request
+    expected_field: id  # Specify the JSON field you expect to validate
+    response_time_threshold: 2000  # Response time threshold in milliseconds
+    load_test: false  # Explicitly marked as not a load test
+
+  - name: "Setup Space"
+    url: https://jsonplaceholder.typicode.com/posts
+    task_order: 2
+    method: POST
+    headers:
+      Content-Type: "application/json"
+    body: |
+      {
+        "title": "foo",
+        "body": "bar",
+        "userId": 1
+      }
+    expected_field: success
+    response_time_threshold: 3000
+    load_test: true  # Explicitly marked as not a load test
+    load_test_config:
+      initial_load: 10
+      max_load: 1000
+      spawn_rate: 100
+      retry_count: 2
+      max_duration_secs: 50  # Maximum duration in seconds for the load test
+
+
+
+
+
+
+
+
